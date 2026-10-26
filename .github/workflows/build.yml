@@ -14,7 +14,7 @@ jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -32,7 +32,9 @@ jobs:
           packages: ''
 
       - name: Install Android SDK components
+        shell: bash
         run: |
+          set -euo pipefail
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-35" \
@@ -56,8 +58,8 @@ jobs:
           fi
 
           if [ -z "$ZIP_PATH" ]; then
-            echo "::error::JARVIS-AI-Android.zip não foi encontrado no repositório."
-            echo "Envie o arquivo ZIP para o repositório e tente novamente."
+            echo "::error::JARVIS-AI-Android.zip não foi encontrado."
+            echo "Coloque o ZIP na raiz do repositório."
             exit 1
           fi
 
@@ -65,7 +67,6 @@ jobs:
 
           EXTRACT_DIR="$RUNNER_TEMP/jarvis-extracted"
           mkdir -p "$EXTRACT_DIR"
-
           unzip -q "$ZIP_PATH" -d "$EXTRACT_DIR"
 
           PROJECT_DIR="$(find "$EXTRACT_DIR" \
@@ -73,14 +74,18 @@ jobs:
             \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
             -print -quit | xargs -r dirname)"
 
-          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
-            echo "::error::Não foi possível localizar o projeto Android dentro do ZIP."
-            echo "Verifique se o ZIP contém settings.gradle.kts e app/build.gradle.kts."
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Arquivo settings.gradle(.kts) não encontrado."
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "::error::app/build.gradle.kts não encontrado no projeto."
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Projeto localizado em: $PROJECT_DIR"
+          echo "Projeto encontrado: $PROJECT_DIR"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -88,14 +93,34 @@ jobs:
           gradle-version: '8.9'
           cache-disabled: true
 
-      - name: Build debug APK
+      - name: Build debug APK with detailed logs
+        shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -euo pipefail
+          set -o pipefail
 
-          gradle --no-daemon --stacktrace :app:assembleDebug
+          LOG_FILE="$RUNNER_TEMP/jarvis-build.log"
+
+          gradle --no-daemon --stacktrace --info \
+            :app:assembleDebug 2>&1 | tee "$LOG_FILE"
+
+          BUILD_STATUS=${PIPESTATUS[0]}
+
+          if [ "$BUILD_STATUS" -ne 0 ]; then
+            echo ""
+            echo "========== ERROS DE COMPILAÇÃO =========="
+
+            grep -n -i -E -B 5 -A 8 \
+              '(^e: |error:|exception|symbol processing|ksp.*error|cannot find|unresolved reference|compilation error)' \
+              "$LOG_FILE" | tail -n 200 || true
+
+            echo "========== FIM DOS ERROS =========="
+          fi
+
+          exit "$BUILD_STATUS"
 
       - name: Run unit tests
+        shell: bash
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           gradle --no-daemon :app:testDebugUnitTest
@@ -108,19 +133,33 @@ jobs:
           APK_PATH="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -f "$APK_PATH" ]; then
-            echo "::error::O APK não foi encontrado após a compilação."
+            echo "::error::APK não encontrado: $APK_PATH"
+            find "$PROJECT_DIR/app/build/outputs" \
+              -type f -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
 
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$APK_PATH" "$GITHUB_WORKSPACE/artifacts/JARVIS-AI-debug.apk"
+
+          cp "$APK_PATH" \
+            "$GITHUB_WORKSPACE/artifacts/JARVIS-AI-debug.apk"
 
           echo "APK preparado com sucesso."
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: JARVIS-AI-Android-APK
           path: artifacts/JARVIS-AI-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-AI-Build-Logs
+          path: ${{ runner.temp }}/jarvis-build.log
+          if-no-files-found: ignore
+          retention-days: 7
